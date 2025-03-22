@@ -4,14 +4,20 @@ Handles file transfer operations and organization.
 """
 
 import hashlib
+import shutil
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Generator
+import os
+import time
 
 from amtt.core.filesystem import FileInfo, FileType
+from amtt.core.batch import BatchConfig
+from amtt.core.transfer_log import TransferLogger, TransferLogEntry
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 
 class OrganizationStrategy(Enum):
@@ -27,23 +33,28 @@ class OrganizationStrategy(Enum):
 class TransferProgress:
     """Progress information for a file transfer"""
 
-    filename: str
-    bytes_transferred: int
-    total_bytes: int
-    percentage: float
-    speed_bps: float
-    eta_seconds: float
+    current_file: str
+    total_files: int
+    current_size: int
+    total_size: int
+    current_batch: int
+    total_batches: int
+    started_at: datetime
+    successful_files: List[str] = field(default_factory=list)
+    failed_files: List[str] = field(default_factory=list)
 
 
 @dataclass
 class TransferResult:
     """Result of a file transfer operation"""
 
-    source: FileInfo
-    destination: Path
-    success: bool
-    error: str | None = None
-    hash: str | None = None
+    successful_files: List[str] = field(default_factory=list)
+    failed_files: List[str] = field(default_factory=list)
+    total_size: int = 0
+    started_at: datetime = field(default_factory=datetime.now)
+    completed_at: Optional[datetime] = None
+    duration: float = 0.0
+    failed_paths: List[str] = field(default_factory=list)
 
 
 class TransferError(Exception):
@@ -67,7 +78,7 @@ class TransferManager:
         """
         self._device = device
         self._filesystem = filesystem
-        self._mtp = device._mtp_device
+        self._logger = TransferLogger()
 
     def _calculate_hash(self, file_path: Path) -> str:
         """
@@ -157,111 +168,264 @@ class TransferManager:
                 return new_path
             counter += 1
 
-    def transfer_file(
+    def _create_batches(self, files: List[str]) -> Generator[List[str], None, None]:
+        """
+        Create batches of files for transfer
+        
+        Args:
+            files: List of file paths to transfer
+            
+        Yields:
+            List of file paths for each batch
+        """
+        current_batch = []
+        current_batch_size = 0
+        
+        for file_path in files:
+            try:
+                # Get file info
+                file_info = self._filesystem.get_file_info(file_path)
+                file_size = file_info.size or 0
+                
+                # If this single file is larger than batch size, make it its own batch
+                if file_size > BatchConfig.MAX_BATCH_SIZE:
+                    if current_batch:
+                        yield current_batch
+                    yield [file_path]
+                    current_batch = []
+                    current_batch_size = 0
+                    continue
+                
+                # If adding this file would exceed batch limits, yield current batch
+                if (current_batch_size + file_size > BatchConfig.MAX_BATCH_SIZE or
+                    len(current_batch) >= BatchConfig.MAX_FILES_PER_BATCH):
+                    yield current_batch
+                    current_batch = []
+                    current_batch_size = 0
+                
+                # Add file to current batch
+                current_batch.append(file_path)
+                current_batch_size += file_size
+                
+            except Exception as e:
+                print(f"Warning: Failed to get info for {file_path}: {e}")
+                continue
+        
+        # Yield any remaining files
+        if current_batch:
+            yield current_batch
+
+    def _get_total_size(self, files: List[str]) -> int:
+        """Calculate total size of files to transfer"""
+        total_size = 0
+        for file_path in files:
+            try:
+                file_info = self._filesystem.get_file_info(file_path)
+                total_size += file_info.size or 0
+            except Exception:
+                continue
+        return total_size
+
+    def _format_size(self, size: int) -> str:
+        """Format size in bytes to human readable string"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size < 1024:
+                return f"{size:.1f}{unit}"
+            size /= 1024
+        return f"{size:.1f}TB"
+
+    def transfer_files(
         self,
-        file_info: FileInfo,
-        destination: Path,
-        organization: OrganizationStrategy = OrganizationStrategy.NONE,
-        verify: bool = False,
-        duplicate_strategy: str = "rename",
-        progress_callback: Callable[[TransferProgress], None] | None = None,
-        delete_source: bool = False,
+        source_paths: List[str],
+        destination_dir: str,
+        delete_source: bool = True,
+        progress_callback=None
     ) -> TransferResult:
         """
-        Transfer a single file from device to local system
-
+        Transfer files in batches
+        
         Args:
-            file_info: Source file information
-            destination: Destination directory path
-            organization: File organization strategy
-            verify: Whether to verify transfer with hash
-            duplicate_strategy: How to handle duplicate files
-            progress_callback: Callback for transfer progress updates
-            delete_source: Whether to delete source file after transfer
-
+            source_paths: List of source file paths
+            destination_dir: Destination directory
+            delete_source: Whether to delete source files after successful transfer (default: True)
+            progress_callback: Callback for progress updates
+            
         Returns:
-            TransferResult: Result of the transfer operation
-
-        Raises:
-            TransferError: If transfer fails
+            TransferResult with transfer statistics
         """
-        try:
-            # Get organized destination path
-            dest_dir = self._get_organized_path(
-                file_info, Path(destination), organization
+        result = TransferResult()
+        
+        # Check if source paths exist and contain files
+        available_files = []
+        for source_path in source_paths:
+            try:
+                # Check if path is a file or directory
+                file_info = self._filesystem.get_file_info(source_path)
+                
+                if file_info.type == FileType.FOLDER:
+                    # Get all files in directory
+                    try:
+                        for file_info in self._filesystem.list_files(source_path):
+                            if file_info.type != FileType.FOLDER:  # Skip folders
+                                available_files.append(file_info.path)
+                    except Exception as e:
+                        print(f"\n[yellow]Directory is empty or all files have been transferred: {source_path}[/yellow]")
+                        continue
+                else:
+                    # Single file
+                    available_files.append(source_path)
+                    
+            except Exception as e:
+                print(f"\n[red]Error accessing {source_path}: {str(e)}[/red]")
+                result.failed_paths.append(source_path)
+                continue
+        
+        if not available_files:
+            print("\n[yellow]No files found to transfer in any of the source paths[/yellow]")
+            result.completed_at = datetime.now()
+            result.duration = (result.completed_at - result.started_at).total_seconds()
+            
+            # Log empty transfer
+            self._logger.add_entry(TransferLogEntry(
+                timestamp=datetime.now().isoformat(),
+                source_dir=source_paths[0] if source_paths else "",
+                destination_dir=destination_dir,
+                successful_files=[],
+                failed_files=[],
+                failed_paths=result.failed_paths,
+                total_size=0,
+                duration=result.duration,
+                delete_source=delete_source
+            ))
+            
+            return result
+            
+        total_size = self._get_total_size(available_files)
+        print(f"\nFound {len(available_files)} files to transfer ({self._format_size(total_size)})")
+        
+        # Create batches
+        batches = list(self._create_batches(available_files))
+        total_batches = len(batches)
+        
+        # Process each batch
+        for batch_num, batch in enumerate(batches, 1):
+            batch_size = self._get_total_size(batch)
+            
+            # Create progress message
+            batch_info = (
+                f"Batch {batch_num}/{total_batches} "
+                f"({self._format_size(batch_size)}/{self._format_size(total_size)})"
             )
-            dest_dir.mkdir(parents=True, exist_ok=True)
-
-            # Handle duplicates
-            dest_path = self._handle_duplicate(
-                dest_dir / file_info.name, duplicate_strategy
+            print(f"\nProcessing {batch_info}")
+            
+            # Process files in this batch
+            for file_num, source_path in enumerate(batch, 1):
+                try:
+                    # Get source file info
+                    file_info = self._filesystem.get_file_info(source_path)
+                    file_size = file_info.size or 0
+                    
+                    # Create destination path
+                    rel_path = source_path.replace("/Internal shared storage/", "", 1)
+                    dest_path = os.path.join(destination_dir, rel_path)
+                    
+                    # Ensure destination directory exists
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    
+                    # Copy file
+                    print(
+                        f"Copying {file_num}/{len(batch)}: "
+                        f"{os.path.basename(source_path)} "
+                        f"({self._format_size(file_size)})"
+                    )
+                    
+                    try:
+                        source_full_path = os.path.join(self._device.mount_point, source_path.lstrip("/"))
+                        shutil.copy2(source_full_path, dest_path)
+                        
+                        # Delete source file if requested
+                        if delete_source:
+                            try:
+                                os.remove(source_full_path)
+                            except Exception as e:
+                                print(f"[yellow]Warning: Failed to delete source file {source_path}: {e}[/yellow]")
+                        
+                        # Update result
+                        result.successful_files.append(source_path)
+                        result.total_size += file_size
+                        
+                    except Exception as e:
+                        print(f"[red]Error copying {source_path}: {e}[/red]")
+                        result.failed_files.append(source_path)
+                    
+                    # Update progress
+                    if progress_callback:
+                        progress_callback(TransferProgress(
+                            current_file=source_path,
+                            total_files=len(available_files),
+                            current_size=result.total_size,
+                            total_size=total_size,
+                            current_batch=batch_num,
+                            total_batches=total_batches,
+                            started_at=result.started_at,
+                            successful_files=result.successful_files,
+                            failed_files=result.failed_files
+                        ))
+                        
+                except Exception as e:
+                    print(f"[red]Error processing {source_path}: {e}[/red]")
+                    result.failed_files.append(source_path)
+            
+            # Delay between batches (except for the last batch)
+            if batch_num < total_batches:
+                print(f"Waiting {BatchConfig.BATCH_DELAY}s before next batch...")
+                time.sleep(BatchConfig.BATCH_DELAY)
+        
+        result.completed_at = datetime.now()
+        result.duration = (result.completed_at - result.started_at).total_seconds()
+        
+        # Log transfer result
+        self._logger.add_entry(TransferLogEntry(
+            timestamp=datetime.now().isoformat(),
+            source_dir=source_paths[0] if source_paths else "",
+            destination_dir=destination_dir,
+            successful_files=result.successful_files,
+            failed_files=result.failed_files,
+            failed_paths=result.failed_paths,
+            total_size=result.total_size,
+            duration=result.duration,
+            delete_source=delete_source
+        ))
+        
+        # Print final summary
+        if result.successful_files:
+            print(
+                f"\n[green]Successfully transferred "
+                f"{len(result.successful_files)} files "
+                f"({self._format_size(result.total_size)})"
             )
-
-            # Get file content with progress tracking
-            file_content = self._mtp.get_file_content(file_info.path)
-
-            # Write file with progress updates
-            bytes_written = 0
-            file_hash = hashlib.sha256()
-
-            with open(dest_path, "wb") as f:
-                for i in range(0, len(file_content), self.BUFFER_SIZE):
-                    chunk = file_content[i : i + self.BUFFER_SIZE]
-                    f.write(chunk)
-                    file_hash.update(chunk)
-
-                    bytes_written += len(chunk)
-                    if progress_callback and file_info.size:
-                        progress = TransferProgress(
-                            filename=file_info.name,
-                            bytes_transferred=bytes_written,
-                            total_bytes=file_info.size,
-                            percentage=(bytes_written / file_info.size) * 100,
-                            speed_bps=0,  # TODO: Implement speed calculation
-                            eta_seconds=0,  # TODO: Implement ETA calculation
-                        )
-                        progress_callback(progress)
-
-            # Verify transfer if requested
-            if verify:
-                if self._calculate_hash(dest_path) != file_hash.hexdigest():
-                    raise TransferError("File verification failed")
-
-            # Delete source if requested
             if delete_source:
-                self._filesystem.delete_file(file_info.path)
-
-            return TransferResult(
-                source=file_info,
-                destination=dest_path,
-                success=True,
-                hash=file_hash.hexdigest() if verify else None,
+                print("[green]Source files have been deleted[/green]")
+            
+        if result.failed_files:
+            print(
+                f"\n[red]Failed to transfer {len(result.failed_files)} files:"
             )
-
-        except Exception as e:
-            return TransferResult(
-                source=file_info,
-                destination=dest_path if "dest_path" in locals() else None,
-                success=False,
-                error=str(e),
+            for file in result.failed_files:
+                print(f"  - {file}")
+                
+        if result.failed_paths:
+            print(
+                f"\n[red]Failed to access {len(result.failed_paths)} paths:"
             )
+            for path in result.failed_paths:
+                print(f"  - {path}")
+                
+        if result.duration > 0:
+            print(f"\nTransfer completed in {result.duration:.1f} seconds")
+            
+        return result
 
-    def batch_transfer(
-        self, files: list[FileInfo], destination: Path, **kwargs
-    ) -> list[TransferResult]:
-        """
-        Transfer multiple files in batch
-
-        Args:
-            files: List of files to transfer
-            destination: Destination directory path
-            **kwargs: Additional arguments passed to transfer_file
-
-        Returns:
-            List[TransferResult]: Results for each transfer
-        """
-        results = []
-        for file_info in files:
-            result = self.transfer_file(file_info, destination, **kwargs)
-            results.append(result)
-        return results
+    def create_directory(self, path: str):
+        """Create a directory at the specified path"""
+        self._filesystem.create_directory(path)

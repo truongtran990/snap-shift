@@ -1,0 +1,71 @@
+@startuml AMTT Activity Diagram
+skinparam backgroundColor white
+skinparam handwritten false
+skinparam monochrome false
+
+title Android Media Transfer Tool - Activity Diagram
+
+|User|
+start
+:Connect Android Device;
+
+|#AntiqueWhite|Device Manager|
+if (Device Connected?) then (yes)
+    :List Available Devices;
+    |User|
+    :Select Device;
+    
+    |#LightBlue|File System|
+    :Browse Files;
+    
+    |User|
+    split
+        :Single File Selection;
+    split again
+        :Batch Selection;
+        :Define Pattern/Filters;
+    end split
+    
+    :Configure Transfer Options;
+    note right
+        * Organization Strategy
+        * Verification Method
+        * Delete Source Option
+        * Duplicate Handling
+    end note
+    
+    |#LightGreen|Transfer Manager|
+    :Initialize Transfer;
+    :Show Progress Bar;
+    
+    while (Transfer in Progress) is (yes)
+        :Process Next File;
+        :Update Progress;
+        if (File Transfer Success?) then (yes)
+            :Verify File Hash;
+        else (no)
+            :Log Error;
+            :Skip to Next File;
+        endif
+    endwhile (no)
+    
+    if (All Files Transferred?) then (yes)
+        if (Delete Source?) then (yes)
+            :Remove Source Files;
+        endif
+        :Show Success Summary;
+    else (no)
+        :Show Error Report;
+        :Offer Retry Options;
+    endif
+    
+else (no)
+    |Device Manager|
+    :Show Connection Error;
+    :Display Troubleshooting Steps;
+endif
+
+|User|
+stop
+
+@enduml 
