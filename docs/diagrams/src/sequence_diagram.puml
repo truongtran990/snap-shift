@@ -1,0 +1,95 @@
+@startuml AMTT Sequence Diagram
+skinparam backgroundColor white
+skinparam handwritten false
+skinparam monochrome false
+skinparam sequenceMessageAlign center
+skinparam sequenceGroupBorderColor gray
+skinparam sequenceGroupBackgroundColor white
+
+title Android Media Transfer Tool - Sequence Diagram
+
+actor User
+participant "CLI Interface" as CLI
+participant "Device Manager" as DM
+participant "File System" as FS
+participant "Transfer Manager" as TM
+participant "Android Device" as AD
+
+== Device Connection ==
+User -> CLI: Launch Application
+CLI -> DM: Initialize Connection
+activate DM
+DM -> AD: Detect Devices
+AD --> DM: Return Device List
+DM --> CLI: Display Available Devices
+deactivate DM
+
+User -> CLI: Select Device
+CLI -> DM: Connect to Device
+activate DM
+DM -> AD: Establish Connection
+AD --> DM: Connection Status
+DM --> CLI: Connection Result
+deactivate DM
+
+== File Discovery ==
+User -> CLI: Request File List
+CLI -> FS: Get File List
+activate FS
+FS -> AD: Read Directory Contents
+AD --> FS: Return Files & Metadata
+FS --> CLI: Display File List
+deactivate FS
+
+== Transfer Setup ==
+User -> CLI: Configure Transfer
+activate CLI
+CLI -> CLI: Validate Options
+note right: Organization Strategy\nVerification Settings\nDuplicate Handling
+CLI --> User: Confirm Settings
+deactivate CLI
+
+== File Transfer ==
+User -> CLI: Start Transfer
+CLI -> TM: Initialize Transfer
+activate TM
+
+group For Each File
+    TM -> FS: Read Source File
+    activate FS
+    FS -> AD: Get File Data
+    AD --> FS: File Content
+    FS --> TM: File Data
+    deactivate FS
+    
+    TM -> TM: Process File
+    note right: Apply Organization\nPrepare Destination
+    
+    TM -> FS: Write to Destination
+    activate FS
+    FS --> TM: Write Status
+    deactivate FS
+    
+    TM -> TM: Verify Transfer
+    TM --> CLI: Update Progress
+    CLI --> User: Show Progress
+end
+
+== Transfer Completion ==
+alt Successful Transfer
+    TM --> CLI: Transfer Complete
+    CLI --> User: Success Message
+    
+    opt Delete Source Files
+        TM -> FS: Delete Original Files
+        FS -> AD: Remove Files
+        AD --> FS: Deletion Status
+    end
+else Failed Transfer
+    TM --> CLI: Transfer Failed
+    CLI --> User: Error Details
+end
+
+deactivate TM
+
+@enduml 

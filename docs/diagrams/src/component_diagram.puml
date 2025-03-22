@@ -1,0 +1,110 @@
+@startuml AMTT Component Diagram
+skinparam backgroundColor white
+skinparam handwritten false
+skinparam monochrome false
+skinparam componentStyle uml2
+skinparam packageStyle rectangle
+
+title Android Media Transfer Tool - Component Diagram
+
+package "AMTT Application" {
+    package "CLI Layer" {
+        [Command Parser] as CP
+        [Progress Display] as PD
+        [Input Validator] as IV
+    }
+    
+    package "Core" {
+        package "Device Management" {
+            [Device Manager] as DM
+            [MTP Protocol Handler] as MPH
+            [Device Discovery] as DD
+        }
+        
+        package "File System" {
+            [File Browser] as FB
+            [Metadata Handler] as MH
+            [Path Manager] as PM
+        }
+        
+        package "Transfer Engine" {
+            [Transfer Manager] as TM
+            [Queue Manager] as QM
+            [Progress Tracker] as PT
+        }
+    }
+    
+    package "Utils" {
+        package "Organization" {
+            [Date Organizer] as DO
+            [Type Organizer] as TO
+            [Custom Templates] as CT
+        }
+        
+        package "Verification" {
+            [Hash Calculator] as HC
+            [Integrity Checker] as IC
+        }
+        
+        package "Error Handling" {
+            [Error Logger] as EL
+            [Recovery Manager] as RM
+        }
+    }
+}
+
+' External Systems
+database "Android Device" as AD
+database "Local Storage" as LS
+
+' CLI Layer Dependencies
+CP --> IV : validates input
+CP --> PD : updates display
+IV --> DM : validates device
+IV --> FB : validates paths
+
+' Core Dependencies
+DM --> MPH : uses
+DM --> DD : uses
+MPH --> AD : communicates
+FB --> MH : uses
+FB --> PM : uses
+TM --> QM : manages
+TM --> PT : tracks
+TM --> FB : reads/writes
+
+' Utils Dependencies
+TM ..> DO : organizes
+TM ..> TO : organizes
+TM ..> CT : applies
+TM ..> HC : verifies
+TM ..> IC : checks
+TM ..> EL : logs
+TM ..> RM : handles errors
+
+' External Dependencies
+FB --> AD : reads from
+FB --> LS : writes to
+
+' Notes
+note right of CP
+  Handles user commands
+  and input processing
+end note
+
+note right of DM
+  Manages device connections
+  and communication
+end note
+
+note right of TM
+  Coordinates file transfers
+  and organization
+end note
+
+note right of FB
+  Handles file operations
+  and metadata
+end note
+
+@enduml 

@@ -1,56 +1,68 @@
 """
-Filesystem module for Android Media Transfer Tool.
-Handles file system navigation and file information retrieval.
+Filesystem operations for Android Media Transfer Tool.
 """
 
 import os
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
+import mimetypes
+from typing import List, Optional
+
+from amtt.core.config import ConfigManager
 
 
 class FileType(Enum):
-    """Enumeration of supported file types"""
+    """Types of files supported by the tool"""
 
     FOLDER = auto()
-    IMAGE = auto()
-    VIDEO = auto()
-    AUDIO = auto()
+    IMAGE = auto()    # jpg, png, gif, etc.
+    VIDEO = auto()    # mp4, mov, etc.
+    AUDIO = auto()    # mp3, wav, etc.
     DOCUMENT = auto()
-    OTHER = auto()
+    OTHER = auto()    # unsupported types
 
 
 @dataclass
 class FileInfo:
-    """Information about a file or folder on the device"""
+    """Information about a file or directory"""
 
     name: str
     path: str
     type: FileType
-    size: int | None = None
-    modified_date: datetime | None = None
+    size: Optional[int] = None
+    modified_date: Optional[datetime] = None
     id: int | None = None
 
 
 class FileSystemError(Exception):
-    """Raised when there are issues with filesystem operations"""
+    """Raised when filesystem operations fail"""
 
     pass
 
 
 class FileSystem:
-    """Handles filesystem operations on the connected device"""
+    """Handles filesystem operations on the device"""
 
-    # Mapping of MIME type prefixes to FileType
-    MIME_TYPE_MAPPING = {
-        "image/": FileType.IMAGE,
-        "video/": FileType.VIDEO,
-        "audio/": FileType.AUDIO,
-        "text/": FileType.DOCUMENT,
-        "application/pdf": FileType.DOCUMENT,
-        "application/msword": FileType.DOCUMENT,
-        "application/vnd.openxmlformats-officedocument": FileType.DOCUMENT,
+    # Supported media file extensions
+    SUPPORTED_EXTENSIONS = {
+        # Images
+        FileType.IMAGE: {
+            '.jpg', '.jpeg', '.png', '.gif', '.bmp', 
+            '.webp', '.heic', '.heif', '.raw', '.dng'
+        },
+        # Videos
+        FileType.VIDEO: {
+            '.mp4', '.mov', '.avi', '.mkv', '.webm',
+            '.3gp', '.m4v', '.mpg', '.mpeg'
+        },
+        # Audio recordings
+        FileType.AUDIO: {
+            '.mp3', '.wav', '.m4a', '.ogg', '.aac',
+            '.flac', '.opus'
+        }
     }
 
     def __init__(self, device):
@@ -60,131 +72,197 @@ class FileSystem:
         Args:
             device: Connected Android device instance
         """
-        self._device = device
-        self._mtp = device._mtp_device
+        self.device = device
+        self.mount_point = device.mount_point
 
-    def _detect_file_type(self, mime_type: str) -> FileType:
-        """
-        Detect file type from MIME type
-
-        Args:
-            mime_type: MIME type string
-
-        Returns:
-            FileType: Detected file type
-        """
-        if mime_type == "folder":
-            return FileType.FOLDER
-
-        for mime_prefix, file_type in self.MIME_TYPE_MAPPING.items():
-            if mime_type.startswith(mime_prefix):
-                return file_type
-
-        return FileType.OTHER
-
-    def _parse_file_info(self, file_data: dict, parent_path: str) -> FileInfo:
-        """
-        Parse raw file information into FileInfo object
-
-        Args:
-            file_data: Raw file data from MTP
-            parent_path: Parent directory path
-
-        Returns:
-            FileInfo: Parsed file information
-        """
-        name = file_data["filename"]
-        path = os.path.join(parent_path, name)
-        file_type = self._detect_file_type(file_data["filetype"])
-
-        # Only regular files have size and modification date
-        size = file_data.get("filesize") if file_type != FileType.FOLDER else None
-
-        modified_date = None
-        if "modificationdate" in file_data:
-            try:
-                modified_date = datetime.strptime(
-                    file_data["modificationdate"], "%Y-%m-%d %H:%M:%S"
-                )
-            except ValueError:
-                pass  # Invalid date format, leave as None
-
-        return FileInfo(
-            name=name,
-            path=path,
-            type=file_type,
-            size=size,
-            modified_date=modified_date,
-            id=file_data.get("id"),
+    def _is_media_file(self, path: str) -> bool:
+        """Check if file is a supported media type"""
+        ext = os.path.splitext(path)[1].lower()
+        return any(
+            ext in extensions
+            for extensions in self.SUPPORTED_EXTENSIONS.values()
         )
 
-    def list_files(self, path: str) -> list[FileInfo]:
-        """
-        List files and folders in the specified path
+    def _get_file_type(self, path: str) -> FileType:
+        """Determine file type from extension"""
+        if os.path.isdir(path):
+            return FileType.FOLDER
+            
+        ext = os.path.splitext(path)[1].lower()
+        
+        # Check each type's extensions
+        for file_type, extensions in self.SUPPORTED_EXTENSIONS.items():
+            if ext in extensions:
+                return file_type
+                
+        return FileType.OTHER
 
+    def _verify_path_safety(self, path: str):
+        """Verify that a path is safe to access"""
+        if not ConfigManager.is_safe_path(path):
+            raise FileSystemError(
+                f"Access to path '{path}' is not allowed for safety reasons. "
+                "Please use only media directories."
+            )
+
+    def list_files(self, path: str) -> List[FileInfo]:
+        """
+        List files in a directory
+        
         Args:
             path: Directory path to list
-
+            
         Returns:
-            List[FileInfo]: List of files and folders
-
+            List of FileInfo objects for files and subdirectories
+            
         Raises:
-            FileSystemError: If listing fails
+            FileSystemError: If path is invalid or inaccessible
         """
         try:
-            files = self._mtp.get_files_and_folders(path)
-            return [self._parse_file_info(f, path) for f in files]
+            # Verify path safety
+            self._verify_path_safety(path)
+            
+            # Get absolute path
+            abs_path = os.path.join(self.mount_point, path.lstrip("/"))
+            if not os.path.exists(abs_path):
+                raise FileSystemError(f"Path does not exist: {path}")
+            if not os.path.isdir(abs_path):
+                raise FileSystemError(f"Path is not a directory: {path}")
+                
+            files = []
+            for entry in os.scandir(abs_path):
+                try:
+                    # Skip hidden files and system directories
+                    if entry.name.startswith("."):
+                        continue
+                        
+                    file_type = self._get_file_type(entry.path)
+                    
+                    # For files (not folders), only include media files
+                    if file_type != FileType.FOLDER and file_type == FileType.OTHER:
+                        continue
+                        
+                    # Get file info
+                    stat = entry.stat()
+                    files.append(
+                        FileInfo(
+                            name=entry.name,
+                            path=os.path.join(path, entry.name),
+                            type=file_type,
+                            size=stat.st_size if file_type != FileType.FOLDER else None,
+                            modified_date=datetime.fromtimestamp(stat.st_mtime)
+                        )
+                    )
+                except (OSError, ValueError) as e:
+                    print(f"Warning: Failed to read {entry.name}: {e}")
+                    continue
+                    
+            return files
+            
         except Exception as e:
-            raise FileSystemError(f"Failed to list files at {path}: {str(e)}") from e
+            raise FileSystemError(f"Failed to list files: {str(e)}")
 
     def get_file_info(self, path: str) -> FileInfo:
         """
-        Get information about a specific file
-
+        Get information about a file or directory
+        
         Args:
-            path: Path to the file
-
+            path: Path to the file or directory
+            
         Returns:
-            FileInfo: File information
-
+            FileInfo object with file details
+            
         Raises:
-            FileSystemError: If file not found or info retrieval fails
+            FileSystemError: If file is invalid or inaccessible
         """
         try:
-            file_data = self._mtp.get_file_info(path)
-            parent_path = str(Path(path).parent)
-            return self._parse_file_info(file_data, parent_path)
+            # Verify path safety
+            self._verify_path_safety(path)
+            
+            # Get absolute path
+            abs_path = os.path.join(self.mount_point, path.lstrip("/"))
+            if not os.path.exists(abs_path):
+                raise FileSystemError(f"Path does not exist: {path}")
+                
+            # Get file type
+            file_type = self._get_file_type(abs_path)
+            
+            # For files (not folders), verify it's a media file
+            if file_type != FileType.FOLDER:
+                if not self._is_media_file(abs_path):
+                    raise FileSystemError(
+                        f"File type not supported: {path}. "
+                        "Only media files (images, videos, recordings) are allowed."
+                    )
+                    
+            # Get file info
+            stat = os.stat(abs_path)
+            return FileInfo(
+                name=os.path.basename(path),
+                path=path,
+                type=file_type,
+                size=stat.st_size if file_type != FileType.FOLDER else None,
+                modified_date=datetime.fromtimestamp(stat.st_mtime)
+            )
+            
         except Exception as e:
-            raise FileSystemError(
-                f"Failed to get file info for {path}: {str(e)}"
-            ) from e
+            raise FileSystemError(f"Failed to get file info: {str(e)}")
 
-    def create_directory(self, path: str) -> None:
+    def create_directory(self, path: str):
         """
         Create a new directory
-
+        
         Args:
-            path: Path where to create directory
-
+            path: Directory path to create
+            
         Raises:
-            FileSystemError: If directory creation fails
+            FileSystemError: If directory cannot be created
         """
         try:
-            self._mtp.create_folder(path)
+            # Verify path safety
+            self._verify_path_safety(path)
+            
+            # Get absolute path
+            abs_path = os.path.join(self.mount_point, path.lstrip("/"))
+            
+            # Create directory
+            os.makedirs(abs_path, exist_ok=True)
+            
         except Exception as e:
-            raise FileSystemError(f"Failed to create directory {path}: {str(e)}") from e
+            raise FileSystemError(f"Failed to create directory: {str(e)}")
 
-    def delete_file(self, path: str) -> None:
+    def delete_file(self, path: str):
         """
-        Delete a file or empty directory
-
+        Delete a file or directory
+        
         Args:
-            path: Path to file or directory to delete
-
+            path: Path to delete
+            
         Raises:
-            FileSystemError: If deletion fails
+            FileSystemError: If file cannot be deleted
         """
         try:
-            self._mtp.delete_object(path)
+            # Verify path safety
+            self._verify_path_safety(path)
+            
+            # Get absolute path
+            abs_path = os.path.join(self.mount_point, path.lstrip("/"))
+            if not os.path.exists(abs_path):
+                raise FileSystemError(f"Path does not exist: {path}")
+                
+            # For files, verify it's a media file
+            if os.path.isfile(abs_path):
+                if not self._is_media_file(abs_path):
+                    raise FileSystemError(
+                        "Only media files can be deleted. "
+                        "System and other files are protected."
+                    )
+                    
+            # Delete file or directory
+            if os.path.isdir(abs_path):
+                os.rmdir(abs_path)  # Only delete if empty
+            else:
+                os.remove(abs_path)
+                
         except Exception as e:
-            raise FileSystemError(f"Failed to delete {path}: {str(e)}") from e
+            raise FileSystemError(f"Failed to delete: {str(e)}")
